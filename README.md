@@ -3,7 +3,7 @@
 ## Installation
 ```
 HACS → Integrations → ⋮ → Custom Repositories
-URL: https://github.com/pedrov/aemo-nemweb
+URL: https://github.com/pedrov/aemo_nemweb
 Category: Integration
 ```
 
