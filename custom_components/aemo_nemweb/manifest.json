@@ -1,0 +1,12 @@
+{
+  "domain": "aemo_nemweb",
+  "name": "AEMO NEMWEB",
+  "codeowners": ["CLAUDE"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/pedrov/aemo-nemweb-ha",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/pedrov/aemo-nemweb-ha/issues",
+  "requirements": ["aiohttp>=3.8.0"],
+  "version": "1.0.0"
+}

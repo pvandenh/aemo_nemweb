@@ -1,0 +1,41 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "AEMO NEMWEB",
+        "description": "Configure AEMO NEMWEB price monitoring for your NEM region.",
+        "data": {
+          "nem_region": "NEM Region"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to NEMWEB",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This region is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "AEMO NEMWEB Settings",
+        "description": "Configure integration options."
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "spot_price": {
+        "name": "Spot Price"
+      },
+      "5min_forecast": {
+        "name": "5 Minute Forecast"
+      },
+      "predispatch_forecast": {
+        "name": "Predispatch Forecast"
+      }
+    }
+  }
+}
