@@ -3,7 +3,7 @@
 ## Installation
 ```
 HACS → Integrations → ⋮ → Custom Repositories
-URL: https://github.com/pedrov/aemo_nemweb
+URL: https://github.com/pvandenh/aemo_nemweb
 Category: Integration
 Search and add AEMO NEMWEB
 Restart Home Assistant
