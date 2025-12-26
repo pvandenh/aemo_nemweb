@@ -4,9 +4,9 @@
   "codeowners": ["CLAUDE"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/pedrov/aemo-nemweb-ha",
+  "documentation": "https://github.com/pedrov/aemo-nemweb",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/pedrov/aemo-nemweb-ha/issues",
+  "issue_tracker": "https://github.com/pedrov/aemo-nemweb/issues",
   "requirements": ["aiohttp>=3.8.0"],
   "version": "1.0.0"
 }
