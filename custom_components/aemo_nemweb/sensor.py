@@ -1,4 +1,4 @@
-"""Sensor entities for AEMO NEMWEB integration."""
+"""Sensor entities for AEMO NEMWEB integration - FIXED NaN display issue."""
 from __future__ import annotations
 
 import logging
@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
+    SensorStateClass,  # ADDED: For proper statistics and display
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -113,7 +114,9 @@ class AEMORealtimePriceSensor(AEMOBaseSensor):
 
     _attr_native_unit_of_measurement = "$/kWh"
     _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.MEASUREMENT  # FIXED: Added for proper statistics
     _attr_icon = "mdi:lightning-bolt"
+    _attr_suggested_display_precision = 4  # FIXED: Show 4 decimal places
 
     def __init__(
         self,
@@ -132,18 +135,35 @@ class AEMORealtimePriceSensor(AEMOBaseSensor):
 
     @property
     def native_value(self) -> float | None:
-        """Return the current real-time price in $/kWh."""
+        """Return the current real-time price in $/kWh.
+        
+        FIXED: Always returns a valid float or None to prevent NaN display issues.
+        """
         if not self.coordinator.data:
             return None
 
+        # Try DISPATCH data first (fastest updates)
         realtime_data = self.coordinator.data.get("realtime_price")
         if realtime_data:
-            return realtime_data.get("price_dollars")
+            price = realtime_data.get("price_dollars")
+            # FIXED: Ensure we return a valid float, explicitly handle None and zero
+            if price is not None:
+                try:
+                    return float(price)
+                except (ValueError, TypeError):
+                    _LOGGER.warning("Invalid price value from DISPATCH: %s", price)
+                    return None
         
         # Fallback to spot price if DISPATCH not available
         spot_data = self.coordinator.data.get("spot_price")
         if spot_data:
-            return spot_data.get("price_dollars")
+            price = spot_data.get("price_dollars")
+            if price is not None:
+                try:
+                    return float(price)
+                except (ValueError, TypeError):
+                    _LOGGER.warning("Invalid price value from P5MIN: %s", price)
+                    return None
         
         return None
 
@@ -177,7 +197,9 @@ class AEMO5MinForecastSensor(AEMOBaseSensor):
 
     _attr_native_unit_of_measurement = "$/kWh"
     _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.MEASUREMENT  # FIXED: Added
     _attr_icon = "mdi:chart-line"
+    _attr_suggested_display_precision = 4  # FIXED: Added
 
     def __init__(
         self,
@@ -199,8 +221,14 @@ class AEMO5MinForecastSensor(AEMOBaseSensor):
         """Return next period forecast price."""
         if self.coordinator.data:
             forecast = self.coordinator.data.get("p5min_forecast", [])
-            if forecast:
-                return forecast[0].get("price_dollars")
+            if forecast and len(forecast) > 0:
+                price = forecast[0].get("price_dollars")
+                if price is not None:
+                    try:
+                        return float(price)  # FIXED: Explicit float conversion
+                    except (ValueError, TypeError):
+                        _LOGGER.warning("Invalid forecast price value: %s", price)
+                        return None
         return None
 
     @property
@@ -231,6 +259,12 @@ class AEMO5MinForecastSensor(AEMOBaseSensor):
                 raw_ts = period.get("timestamp", "")
                 iso_ts = self._convert_to_iso_timestamp(raw_ts)
 
+                # FIXED: Ensure price is a valid float
+                try:
+                    price = float(price) if price is not None else 0.0
+                except (ValueError, TypeError):
+                    price = 0.0
+
                 prices.append(price)
                 timestamps.append(iso_ts)
                 prices_cents.append(period.get("price_cents", 0))
@@ -257,7 +291,9 @@ class AEMOPredispatchForecastSensor(AEMOBaseSensor):
 
     _attr_native_unit_of_measurement = "$/kWh"
     _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.MEASUREMENT  # FIXED: Added
     _attr_icon = "mdi:chart-timeline-variant"
+    _attr_suggested_display_precision = 4  # FIXED: Added
 
     def __init__(
         self,
@@ -279,8 +315,14 @@ class AEMOPredispatchForecastSensor(AEMOBaseSensor):
         """Return next period forecast price."""
         if self.coordinator.data:
             forecast = self.coordinator.data.get("predispatch_forecast", [])
-            if forecast:
-                return forecast[0].get("price_dollars")
+            if forecast and len(forecast) > 0:
+                price = forecast[0].get("price_dollars")
+                if price is not None:
+                    try:
+                        return float(price)  # FIXED: Explicit float conversion
+                    except (ValueError, TypeError):
+                        _LOGGER.warning("Invalid predispatch price value: %s", price)
+                        return None
         return None
 
     @property
@@ -310,6 +352,12 @@ class AEMOPredispatchForecastSensor(AEMOBaseSensor):
                 price = period.get("price_dollars", 0)
                 raw_ts = period.get("timestamp", "")
                 iso_ts = self._convert_to_iso_timestamp(raw_ts)
+
+                # FIXED: Ensure price is a valid float
+                try:
+                    price = float(price) if price is not None else 0.0
+                except (ValueError, TypeError):
+                    price = 0.0
 
                 prices.append(price)
                 timestamps.append(iso_ts)
