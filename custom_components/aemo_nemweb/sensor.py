@@ -28,6 +28,10 @@ from .coordinator import AEMOCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
+# Minimum price threshold - anything below this is treated as zero
+# $0.0001/kWh = $0.1/MWh which is effectively free electricity
+MIN_PRICE_THRESHOLD = 0.0001
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -108,6 +112,33 @@ class AEMOBaseSensor(CoordinatorEntity[AEMOCoordinator], SensorEntity):
         except (ValueError, TypeError):
             return timestamp
 
+    def _normalize_price(self, price: float | None) -> float | None:
+        """Normalize price value to prevent NaN display.
+        
+        Very small prices (< $0.0001/kWh) are treated as zero to avoid
+        scientific notation display issues in Home Assistant UI.
+        
+        Args:
+            price: Raw price value in $/kWh
+            
+        Returns:
+            Normalized price or None if invalid
+        """
+        if price is None:
+            return None
+            
+        try:
+            price_float = float(price)
+            # Treat extremely small values as zero
+            # Anything less than $0.0001/kWh ($0.1/MWh) is effectively free
+            if abs(price_float) < MIN_PRICE_THRESHOLD:
+                return 0.0
+            # Round to 4 decimal places to avoid scientific notation
+            return round(price_float, 4)
+        except (ValueError, TypeError):
+            _LOGGER.warning("Invalid price value: %s", price)
+            return None
+
 
 class AEMORealtimePriceSensor(AEMOBaseSensor):
     """Sensor for real-time price from DISPATCH files (fastest updates)."""
@@ -137,7 +168,7 @@ class AEMORealtimePriceSensor(AEMOBaseSensor):
     def native_value(self) -> float | None:
         """Return the current real-time price in $/kWh.
         
-        FIXED: Always returns a valid float or None to prevent NaN display issues.
+        FIXED: Normalizes tiny values to prevent NaN/scientific notation display.
         """
         if not self.coordinator.data:
             return None
@@ -146,24 +177,13 @@ class AEMORealtimePriceSensor(AEMOBaseSensor):
         realtime_data = self.coordinator.data.get("realtime_price")
         if realtime_data:
             price = realtime_data.get("price_dollars")
-            # FIXED: Ensure we return a valid float, explicitly handle None and zero
-            if price is not None:
-                try:
-                    return float(price)
-                except (ValueError, TypeError):
-                    _LOGGER.warning("Invalid price value from DISPATCH: %s", price)
-                    return None
+            return self._normalize_price(price)
         
         # Fallback to spot price if DISPATCH not available
         spot_data = self.coordinator.data.get("spot_price")
         if spot_data:
             price = spot_data.get("price_dollars")
-            if price is not None:
-                try:
-                    return float(price)
-                except (ValueError, TypeError):
-                    _LOGGER.warning("Invalid price value from P5MIN: %s", price)
-                    return None
+            return self._normalize_price(price)
         
         return None
 
@@ -223,12 +243,7 @@ class AEMO5MinForecastSensor(AEMOBaseSensor):
             forecast = self.coordinator.data.get("p5min_forecast", [])
             if forecast and len(forecast) > 0:
                 price = forecast[0].get("price_dollars")
-                if price is not None:
-                    try:
-                        return float(price)  # FIXED: Explicit float conversion
-                    except (ValueError, TypeError):
-                        _LOGGER.warning("Invalid forecast price value: %s", price)
-                        return None
+                return self._normalize_price(price)
         return None
 
     @property
@@ -259,19 +274,18 @@ class AEMO5MinForecastSensor(AEMOBaseSensor):
                 raw_ts = period.get("timestamp", "")
                 iso_ts = self._convert_to_iso_timestamp(raw_ts)
 
-                # FIXED: Ensure price is a valid float
-                try:
-                    price = float(price) if price is not None else 0.0
-                except (ValueError, TypeError):
-                    price = 0.0
+                # FIXED: Normalize price to prevent scientific notation
+                normalized_price = self._normalize_price(price)
+                if normalized_price is None:
+                    normalized_price = 0.0
 
-                prices.append(price)
+                prices.append(normalized_price)
                 timestamps.append(iso_ts)
                 prices_cents.append(period.get("price_cents", 0))
                 prices_mwh.append(period.get("price_mwh", 0))
 
                 if iso_ts:
-                    forecast_dict[iso_ts] = price
+                    forecast_dict[iso_ts] = normalized_price
 
             attrs["forecast"] = prices
             attrs["timestamps"] = timestamps
@@ -317,12 +331,7 @@ class AEMOPredispatchForecastSensor(AEMOBaseSensor):
             forecast = self.coordinator.data.get("predispatch_forecast", [])
             if forecast and len(forecast) > 0:
                 price = forecast[0].get("price_dollars")
-                if price is not None:
-                    try:
-                        return float(price)  # FIXED: Explicit float conversion
-                    except (ValueError, TypeError):
-                        _LOGGER.warning("Invalid predispatch price value: %s", price)
-                        return None
+                return self._normalize_price(price)
         return None
 
     @property
@@ -353,19 +362,18 @@ class AEMOPredispatchForecastSensor(AEMOBaseSensor):
                 raw_ts = period.get("timestamp", "")
                 iso_ts = self._convert_to_iso_timestamp(raw_ts)
 
-                # FIXED: Ensure price is a valid float
-                try:
-                    price = float(price) if price is not None else 0.0
-                except (ValueError, TypeError):
-                    price = 0.0
+                # FIXED: Normalize price to prevent scientific notation
+                normalized_price = self._normalize_price(price)
+                if normalized_price is None:
+                    normalized_price = 0.0
 
-                prices.append(price)
+                prices.append(normalized_price)
                 timestamps.append(iso_ts)
                 prices_cents.append(period.get("price_cents", 0))
                 prices_mwh.append(period.get("price_mwh", 0))
 
                 if iso_ts:
-                    forecast_dict[iso_ts] = price
+                    forecast_dict[iso_ts] = normalized_price
 
             attrs["forecast"] = prices
             attrs["timestamps"] = timestamps
