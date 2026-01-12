@@ -161,10 +161,15 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _should_poll_now(self) -> bool:
         """Determine if we should poll based on current time and period boundary.
         
-        Dynamically adjusts update_interval:
-        - WAIT mode (>30s until boundary): 30 second checks (minimal overhead)
-        - WAIT mode (<30s until boundary): 5 second checks (prepare for active mode)
-        - ACTIVE mode: 1 second checks (rapid polling)
+        Dynamically adjusts update_interval with 3-tier strategy:
+        - WAIT mode (>10s until boundary): 45 second checks (minimal overhead)
+        - PRE-ACTIVE mode (10s before to 15s after boundary): 5 second checks
+        - ACTIVE mode (15s+ after boundary): 1 second checks (rapid polling for new files)
+        
+        Example timeline for 17:15:00 boundary:
+        - 17:14:00-17:14:49: WAIT mode, 45s intervals
+        - 17:14:50-17:15:14: PRE-ACTIVE mode, 5s intervals (files never appear this early)
+        - 17:15:15+: ACTIVE mode, 1s intervals (files typically appear now)
         
         Returns:
             True if we should poll, False if we should wait
@@ -175,11 +180,12 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return True
         
         now = datetime.now()
+        seconds_from_boundary = (now - self._current_period_end).total_seconds()
         
-        if now < self._current_period_end:
-            # Still in current period, wait
+        if seconds_from_boundary < -10:
+            # More than 10s before boundary: WAIT mode
             if self._polling_mode != 'wait':
-                seconds_until = (self._current_period_end - now).total_seconds()
+                seconds_until = -seconds_from_boundary
                 _LOGGER.info(
                     "Entering WAIT mode until %s (next period boundary in %d seconds)",
                     self._current_period_end.strftime("%H:%M:%S"),
@@ -187,27 +193,39 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 self._polling_mode = 'wait'
                 self._active_polling_count = 0
-            
-            # Adjust interval based on time remaining
-            seconds_until = (self._current_period_end - now).total_seconds()
-            if seconds_until > 30:
-                # Far from boundary: slow polling
-                self.update_interval = timedelta(seconds=30)
-            else:
-                # Close to boundary: faster polling to catch the transition
-                self.update_interval = timedelta(seconds=5)
-            
+            # Long wait: 45 second intervals
+            self.update_interval = timedelta(seconds=45)
             return False
+            
+        elif seconds_from_boundary < 15:
+            # From 10s before to 15s after boundary: PRE-ACTIVE mode
+            if self._polling_mode != 'pre_active':
+                if seconds_from_boundary < 0:
+                    _LOGGER.info(
+                        "Entering PRE-ACTIVE mode (5s intervals) - boundary in %d seconds",
+                        int(-seconds_from_boundary)
+                    )
+                else:
+                    _LOGGER.info(
+                        "Entering PRE-ACTIVE mode (5s intervals) - %d seconds into period",
+                        int(seconds_from_boundary)
+                    )
+                self._polling_mode = 'pre_active'
+                self._active_polling_count = 0
+            # Pre-active: 5 second intervals (files don't appear yet)
+            self.update_interval = timedelta(seconds=5)
+            return False
+            
         else:
-            # Past period boundary, enter active polling
+            # 15+ seconds past boundary: ACTIVE mode
             if self._polling_mode != 'active':
                 _LOGGER.info(
                     "Entering ACTIVE POLLING mode (1s intervals) - looking for new data"
                 )
                 self._polling_mode = 'active'
                 self._active_polling_count = 0
-                # Speed up updates during active polling
-                self.update_interval = timedelta(seconds=1)
+            # Active polling: 1 second intervals
+            self.update_interval = timedelta(seconds=1)
             return True
 
     async def _async_update_data(self) -> dict[str, Any]:
