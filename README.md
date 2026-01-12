@@ -20,7 +20,7 @@ Select Region: NSW1 / QLD1 / VIC1 / SA1 / TAS1
 
 | Sensor | Updates | Description |
 |--------|---------|-------------|
-| `sensor.aemo_nemweb_{region}_realtime_price` | 5s | Current spot price |
+| `sensor.aemo_nemweb_{region}_realtime_price` | 1s | Current spot price |
 | `sensor.aemo_nemweb_{region}_5min_forecast` | 30s | Next hour forecast |
 | `sensor.aemo_nemweb_{region}_predispatch_forecast` | 5m | 48-hour forecast |
 
