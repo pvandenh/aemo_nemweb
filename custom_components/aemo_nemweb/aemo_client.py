@@ -88,7 +88,8 @@ class AEMOClient:
             # Check cache
             if latest_file in self._dispatch_cache:
                 _LOGGER.debug("Using cached DISPATCH data for %s", latest_file)
-                return self._dispatch_cache[latest_file], latest_file
+                cached_data = self._dispatch_cache[latest_file]
+                return cached_data[0], cached_data[1], latest_file
             
             file_url = f"{AEMO_DISPATCH_URL}{latest_file}"
             _LOGGER.info("Downloading NEW DISPATCH file: %s", latest_file)
@@ -102,7 +103,7 @@ class AEMOClient:
                 content = await response.read()
 
             prices, demands = self._parse_dispatch_zip(content)
-            self._dispatch_cache = {latest_file: tuple[prices, demands]}
+            self._dispatch_cache = {latest_file: (prices, demands)}
 
             return prices, demands, latest_file
 
