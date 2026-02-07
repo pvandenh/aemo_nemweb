@@ -248,6 +248,7 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             data: dict[str, Any] = {
+                "realtime_demand": None,
                 "realtime_price": None,
                 "spot_price": None,
                 "p5min_forecast": [],
@@ -261,6 +262,7 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Keep existing data as defaults
             if self.data:
+                data["realtime_demand"] = self.data.get("realtime_demand") 
                 data["realtime_price"] = self.data.get("realtime_price")
                 data["spot_price"] = self.data.get("spot_price")
                 data["p5min_forecast"] = self.data.get("p5min_forecast", [])
@@ -271,7 +273,7 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Try DISPATCH first (fastest updates, ~2-3 min)
             try:
-                dispatch_prices, dispatch_file = await self._aemo_client.get_dispatch_price_with_file()
+                dispatch_prices, dispatch_demand, dispatch_file = await self._aemo_client.get_dispatch_price_with_file()
                 
                 if dispatch_file and dispatch_file != self._last_dispatch_file:
                     _LOGGER.info(
@@ -283,10 +285,12 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._dispatch_available = True
                     found_new_data = True
                     
-                    region_data = dispatch_prices.get(self.region, {})
-                    if region_data:
-                        data["realtime_price"] = region_data
-                        timestamp = region_data.get("timestamp")
+                    region_data_prices = dispatch_prices.get(self.region, {})
+                    region_data_demand = dispatch_demand.get(self.region, {})
+                    if region_data_prices:
+                        data["realtime_demand"] = region_data_demand
+                        data["realtime_price"] = region_data_prices
+                        timestamp = region_data_prices.get("timestamp")
                         data["last_update"] = timestamp
                         
                         # Update period boundary
@@ -302,22 +306,22 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 )
                         
                         # Calculate spike detection metrics
-                        current_price = region_data.get("price_mwh", 0)
+                        current_price = region_data_prices.get("price_mwh", 0)
                         data["spike_info"] = self._aemo_client.calculate_spike_info(current_price)
                         
                         _LOGGER.info(
                             "Real-time price for %s: $%.4f/kWh (spike: %s, ratio: %.2fx)",
                             self.region,
-                            region_data.get("price_dollars", 0),
+                            region_data_prices.get("price_dollars", 0),
                             "YES" if data["spike_info"].get("is_spike") else "no",
                             data["spike_info"].get("spike_ratio", 1.0)
                         )
                 elif dispatch_prices and not found_new_data:
                     # File is cached, but we still need to set period boundary on first run
                     if self._current_period_end is None:
-                        region_data = dispatch_prices.get(self.region, {})
-                        if region_data:
-                            timestamp = region_data.get("timestamp")
+                        region_data_prices = dispatch_prices.get(self.region, {})
+                        if region_data_prices:
+                            timestamp = region_data_prices.get("timestamp")
                             if timestamp:
                                 period_dt = self._parse_aemo_timestamp(timestamp)
                                 if period_dt:

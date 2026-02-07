@@ -35,6 +35,9 @@
       },
       "predispatch_forecast": {
         "name": "Predispatch Forecast"
+      },
+      "realtime_demand": {
+        "name": "Regional Demand"
       }
     }
   }

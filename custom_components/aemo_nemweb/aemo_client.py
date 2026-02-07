@@ -39,7 +39,7 @@ class AEMOClient:
         # For spike detection
         self._price_history: list[float] = []  # Last 12 prices (1 hour)
 
-    async def get_dispatch_price_with_file(self) -> tuple[dict[str, dict[str, Any]], str]:
+    async def get_dispatch_price_with_file(self) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], str]:
         """Fetch real-time dispatch price (updated every ~2-3 minutes).
         
         This is faster than P5MIN files and gives near real-time prices.
@@ -50,7 +50,7 @@ class AEMOClient:
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 if response.status != 200:
-                    return {}, ""
+                    return {}, {}, ""
                 html = await response.text()
 
             # Pattern for DispatchIS files  
@@ -66,7 +66,7 @@ class AEMOClient:
                 all_matches = re.findall(pattern, html)
                 
             if not all_matches:
-                return {}, ""
+                return {}, {}, ""
 
             latest_timestamp = sorted(all_matches)[-1]
             
@@ -81,7 +81,7 @@ class AEMOClient:
                 latest_files = re.findall(latest_pattern, html)
             
             if not latest_files:
-                return {}, ""
+                return {}, {}, ""
             
             latest_file = latest_files[0]
             
@@ -98,24 +98,26 @@ class AEMOClient:
                 timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 if response.status != 200:
-                    return {}, ""
+                    return {}, {}, ""
                 content = await response.read()
 
-            prices = self._parse_dispatch_zip(content)
-            self._dispatch_cache = {latest_file: prices}
-            
-            return prices, latest_file
+            prices, demands = self._parse_dispatch_zip(content)
+            self._dispatch_cache = {latest_file: tuple[prices, demands]}
+
+            return prices, demands, latest_file
 
         except Exception as e:
             _LOGGER.debug("Error fetching DISPATCH (expected if files not available): %s", e)
-            return {}, ""
+            return {}, {}, ""
 
-    def _parse_dispatch_zip(self, content: bytes) -> dict[str, dict[str, Any]]:
-        """Parse DispatchIS ZIP for current regional prices.
+    def _parse_dispatch_zip(self, content: bytes) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Parse DispatchIS ZIP for current regional prices and demand.
         
-        DispatchIS files contain DISPATCH.REGIONSUM tables with regional price data.
+        DispatchIS files contain DISPATCH.PRICE tables with regional price data.
+        DispatchIS files contain DISPATCH.REGIONSUM tables with regional demand data.
         """
         prices = {}
+        demands = {}
 
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as zf:
@@ -197,18 +199,44 @@ class AEMOClient:
                                                             "price_dollars": rrp / 1000,
                                                             "timestamp": settlementdate,
                                                         }
+
                                         except (ValueError, IndexError) as e:
                                             _LOGGER.debug("Parse error in DISPATCH.PRICE row: %s", e)
+                                            continue
+
+                                    # Look for DISPATCH.REGIONSUM table (has TOTALDEMAND column)
+                                    if table_name.upper() == "DISPATCH.REGIONSUM":
+                                        try:
+                                            # DISPATCH.REGIONSUM format:
+                                            # D, DISPATCH, REGIONSUM, 9, SETTLEMENTDATE, RUNNO, REGIONID, DISPATCHINTERVAL, INTERVENTION, TOTALDEMAND, ...
+                                            # ... lots of columns ... AGGREGATEDISPATCHERROR, LASTCHANGED, INITIALSUPPLY, CLEAREDSUPPLY ...
+                                            #
+                                            # We're looking for Cleared Supply - column 69
+                                            # Indices: 0, 1, 2, 3, 4, 5, 6,  ... 69
+                                            
+                                            if len(row) > 69:
+                                                regionid = row[6].strip().strip('"')
+                                                
+                                                if regionid in NEM_REGIONS:
+                                                    settlementdate = row[4].strip().strip('"')
+                                                    demand = float(row[69].strip())
+                                                    
+                                                    demands[regionid] = {
+                                                        "demand_mw": demand,
+                                                        "timestamp": settlementdate,
+                                                    }
+                                        except (ValueError, IndexError) as e:
+                                            _LOGGER.debug("Parse error in DISPATCH.REGIONSUM row: %s", e)
                                             continue
 
             if not prices:
                 _LOGGER.warning("No prices extracted from DISPATCH file. Header cols: %s", header_cols)
             
-            return prices
+            return prices, demands
 
         except Exception as e:
             _LOGGER.error("Error parsing DISPATCH ZIP: %s", e, exc_info=True)
-            return {}
+            return {}, {}
 
     async def get_current_prices_with_file(self) -> tuple[dict[str, dict[str, Any]], str]:
         """Fetch ACTUAL current prices from P5MIN (most recent completed period)."""
@@ -414,7 +442,7 @@ class AEMOClient:
                                         continue
 
             _LOGGER.debug("P5MIN parse: %d total rows, %d REGIONSOLUTION rows, %d for region %s", 
-                         row_count, regionsolution_count, len(all_rows), region)
+                row_count, regionsolution_count, len(all_rows), region)
 
             all_rows.sort(key=lambda x: x["timestamp"])
             

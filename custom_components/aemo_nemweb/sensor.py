@@ -22,6 +22,7 @@ from .const import (
     REGION_TIMEZONES,
     SENSOR_TYPE_5MIN_FORECAST,
     SENSOR_TYPE_PREDISPATCH_FORECAST,
+    SENSOR_TYPE_REALTIME_DEMAND,
     SENSOR_TYPE_REALTIME_PRICE,
 )
 from .coordinator import AEMOCoordinator
@@ -46,6 +47,7 @@ async def async_setup_entry(
         AEMORealtimePriceSensor(coordinator, config_entry, region),
         AEMO5MinForecastSensor(coordinator, config_entry, region),
         AEMOPredispatchForecastSensor(coordinator, config_entry, region),
+        AEMORealtimeDemandSensor(coordinator, config_entry, region),
     ]
 
     async_add_entities(entities)
@@ -386,3 +388,62 @@ class AEMOPredispatchForecastSensor(AEMOBaseSensor):
             attrs["last_update"] = self.coordinator.data.get("last_update")
 
         return attrs
+
+class AEMORealtimeDemandSensor(AEMOBaseSensor):
+    """Sensor for real-time demand from DISPATCH files (fastest updates)."""
+
+    _attr_native_unit_of_measurement = "MW"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:lightning-bolt"
+    _attr_suggested_display_precision = 2
+
+    def __init__(
+        self,
+        coordinator: AEMOCoordinator,
+        config_entry: ConfigEntry,
+        region: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(
+            coordinator, 
+            config_entry, 
+            region, 
+            SENSOR_TYPE_REALTIME_DEMAND,
+            "AEMO NEMWEB Realtime Demand"
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the current real-time demand in MW.
+        
+        """
+        if not self.coordinator.data:
+            return None
+
+        realtime_data = self.coordinator.data.get("realtime_demand")
+        if realtime_data:
+            demand = realtime_data.get("demand_mw")
+            return self._normalize_price(demand)
+        
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional state attributes."""
+        if not self.coordinator.data:
+            return {}
+
+        realtime_data = self.coordinator.data.get("realtime_demand")
+        
+        if not realtime_data:
+            return {"region": self._region, "source": "waiting for data"}
+
+        timestamp = realtime_data.get("timestamp", "")
+        
+        return {
+            "demand_mw": realtime_data.get("demand_mw"),
+            "timestamp": self._convert_to_iso_timestamp(timestamp),
+            "region": self._region,
+            "source": "DISPATCH" if self.coordinator._dispatch_available else "Waiting",
+        }

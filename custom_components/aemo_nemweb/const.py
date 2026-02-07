@@ -28,6 +28,7 @@ UPDATE_INTERVAL_CURRENT = 300  # 5 minutes for current and 5min forecast
 UPDATE_INTERVAL_PREDISPATCH = 1800  # 30 minutes for predispatch forecast
 
 # Sensor Types (only keeping the ones we use)
+SENSOR_TYPE_REALTIME_DEMAND = "realtime_demand"
 SENSOR_TYPE_REALTIME_PRICE = "realtime_price"
 SENSOR_TYPE_5MIN_FORECAST = "5min_forecast"
 SENSOR_TYPE_PREDISPATCH_FORECAST = "predispatch_forecast"
