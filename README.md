@@ -2,7 +2,7 @@
 
 This integration provides basic yet reliable AEMO spot and forecast data values.
 It uses NEMWEB as data source, with a focus being on speed of data fetch.
-It checks for new data each minute, and upon the commencement of the 5th minute it will speed up to checking for updating every second, until new data is found (at which point it will slow down polling again to each minute).
+It checks for new data each minute while in standby, and upon the commencement of the 5th minute it will speed up to checking for updates every second, until new data is found (at which point it will slow down polling again to each minute).
 Average time on new data being present is <30 seconds into the interval.
 
 ## Installation
