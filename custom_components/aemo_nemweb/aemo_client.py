@@ -5,7 +5,6 @@ No battery automations - just provides data for user decisions.
 """
 from __future__ import annotations
 
-import asyncio
 import csv
 import io
 import logging
@@ -33,83 +32,115 @@ class AEMOClient:
         """Initialize the AEMO client."""
         self._session = session
         self._p5min_cache: dict[str, Any] = {}
+        self._p5min_zip_cache: dict[str, bytes] = {}  # raw ZIP bytes for forecast reuse
         self._dispatch_cache: dict[str, Any] = {}
         self._predispatch_cache: dict[str, Any] = {}
         
         # For spike detection
         self._price_history: list[float] = []  # Last 12 prices (1 hour)
 
-    async def get_dispatch_price_with_file(self) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], str]:
-        """Fetch real-time dispatch price (updated every ~2-3 minutes).
-        
-        This is faster than P5MIN files and gives near real-time prices.
+    async def poll_dispatch_directory(self) -> str:
+        """Fetch the DISPATCH directory listing and return the latest filename.
+
+        This is a cheap ~5 KB HTML request called every second during the
+        HUNT window.  It returns only the filename so the coordinator can
+        detect a new file without paying the cost of a ZIP download.
+
+        Returns "" on any failure or when no matching files are found.
         """
         try:
             async with self._session.get(
                 AEMO_DISPATCH_URL,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as response:
                 if response.status != 200:
-                    return {}, {}, ""
+                    return ""
                 html = await response.text()
 
-            # Pattern for DispatchIS files  
-            # Files are like: PUBLIC_DISPATCHIS_202512251520_0000000495664033.zip
-            # Format: PUBLIC_DISPATCHIS_{timestamp}_{sequence}.zip
+            # Primary pattern: PUBLIC_DISPATCHIS_{12-digit-ts}_{sequence}.zip
             pattern = r'PUBLIC_DISPATCHIS_(\d{12})_\d+\.zip'
             all_matches = re.findall(pattern, html)
-            
+
             if not all_matches:
-                _LOGGER.debug("No DISPATCHIS files found, trying alternative pattern")
-                # Try broader pattern for any dispatch-related files
+                # Fallback: any PUBLIC_DISPATCH* variant
                 pattern = r'PUBLIC_DISPATCH[A-Z]*_(\d{12})_\d+\.zip'
                 all_matches = re.findall(pattern, html)
-                
+
             if not all_matches:
-                return {}, {}, ""
+                return ""
 
             latest_timestamp = sorted(all_matches)[-1]
-            
-            # Find the actual filename - DispatchIS format with sequence number
-            # Format: PUBLIC_DISPATCHIS_{timestamp}_{sequence}.zip
+
+            # Recover the full filename including the sequence suffix
             latest_pattern = f'PUBLIC_DISPATCHIS_{latest_timestamp}_\\d+\\.zip'
             latest_files = re.findall(latest_pattern, html)
-            
             if not latest_files:
-                # Try broader pattern for any dispatch file with this timestamp
                 latest_pattern = f'PUBLIC_DISPATCH[A-Z]*_{latest_timestamp}_\\d+\\.zip'
                 latest_files = re.findall(latest_pattern, html)
-            
-            if not latest_files:
-                return {}, {}, ""
-            
-            latest_file = latest_files[0]
-            
-            # Check cache
-            if latest_file in self._dispatch_cache:
-                _LOGGER.debug("Using cached DISPATCH data for %s", latest_file)
-                cached_data = self._dispatch_cache[latest_file]
-                return cached_data[0], cached_data[1], latest_file
-            
-            file_url = f"{AEMO_DISPATCH_URL}{latest_file}"
-            _LOGGER.info("Downloading NEW DISPATCH file: %s", latest_file)
 
-            async with self._session.get(
-                file_url,
-                timeout=aiohttp.ClientTimeout(total=60)
-            ) as response:
-                if response.status != 200:
-                    return {}, {}, ""
-                content = await response.read()
-
-            prices, demands = self._parse_dispatch_zip(content)
-            self._dispatch_cache = {latest_file: (prices, demands)}
-
-            return prices, demands, latest_file
+            return latest_files[0] if latest_files else ""
 
         except Exception as e:
-            _LOGGER.debug("Error fetching DISPATCH (expected if files not available): %s", e)
+            _LOGGER.debug("DISPATCH directory poll failed: %s", e)
+            return ""
+
+    async def fetch_dispatch_zip(
+        self, filename: str
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Download and parse a specific DISPATCH ZIP file.
+
+        Only called when ``poll_dispatch_directory`` returns a filename
+        that the coordinator has not seen before.  Results are cached so
+        any repeated call with the same filename is free.
+
+        Returns (prices, demands) dicts keyed by region, or ({}, {}) on
+        any failure.
+        """
+        if not filename:
+            return {}, {}
+
+        if filename in self._dispatch_cache:
+            _LOGGER.debug("Using cached DISPATCH data for %s", filename)
+            cached = self._dispatch_cache[filename]
+            return cached[0], cached[1]
+
+        file_url = f"{AEMO_DISPATCH_URL}{filename}"
+        _LOGGER.info("Downloading NEW DISPATCH file: %s", filename)
+
+        try:
+            async with self._session.get(
+                file_url,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status != 200:
+                    _LOGGER.debug(
+                        "DISPATCH ZIP returned HTTP %d for %s",
+                        response.status, filename,
+                    )
+                    return {}, {}
+                content = await response.read()
+        except Exception as e:
+            _LOGGER.debug("DISPATCH ZIP download failed for %s: %s", filename, e)
+            return {}, {}
+
+        prices, demands = self._parse_dispatch_zip(content)
+        # Single-entry cache — evicts the previous file automatically
+        self._dispatch_cache = {filename: (prices, demands)}
+        return prices, demands
+
+    async def get_dispatch_price_with_file(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], str]:
+        """Combined directory poll + ZIP fetch (convenience wrapper).
+
+        Calls ``poll_dispatch_directory`` then ``fetch_dispatch_zip`` so
+        existing call-sites continue to work unchanged.
+        """
+        filename = await self.poll_dispatch_directory()
+        if not filename:
             return {}, {}, ""
+        prices, demands = await self.fetch_dispatch_zip(filename)
+        return prices, demands, filename
 
     def _parse_dispatch_zip(self, content: bytes) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         """Parse DispatchIS ZIP for current regional prices and demand.
@@ -240,7 +271,12 @@ class AEMOClient:
             return {}, {}
 
     async def get_current_prices_with_file(self) -> tuple[dict[str, dict[str, Any]], str]:
-        """Fetch ACTUAL current prices from P5MIN (most recent completed period)."""
+        """Fetch ACTUAL current prices from P5MIN (most recent completed period).
+
+        Caches the raw ZIP bytes under ``_p5min_zip_cache`` so that a
+        subsequent call to ``get_p5min_forecast`` can parse the forecast rows
+        from the same bytes without a second HTTP request.
+        """
         try:
             async with self._session.get(
                 AEMO_P5MIN_ACTUAL_URL,
@@ -281,7 +317,9 @@ class AEMOClient:
                 content = await response.read()
 
             prices = self._parse_p5min_actual(content)
+            # Cache both the parsed prices and the raw bytes for forecast reuse
             self._p5min_cache = {latest_file: prices}
+            self._p5min_zip_cache = {latest_file: content}
             
             return prices, latest_file
 
@@ -356,8 +394,21 @@ class AEMOClient:
     async def get_p5min_forecast(
         self, region: str, periods: int = 12
     ) -> list[dict[str, Any]]:
-        """Get 5-min FORECAST prices."""
+        """Get 5-min FORECAST prices.
+
+        Reuses the raw ZIP bytes cached by the most recent call to
+        ``get_current_prices_with_file`` so no second HTTP request is made
+        when both are called in the same SLOW tick.  Falls back to a fresh
+        download only when the cache is cold (e.g. on startup).
+        """
         try:
+            # Try to use the already-downloaded ZIP bytes
+            if self._p5min_zip_cache:
+                latest_file, content = next(iter(self._p5min_zip_cache.items()))
+                _LOGGER.debug("P5MIN forecast from cached ZIP: %s", latest_file)
+                return self._parse_p5min_forecast(content, region, periods)
+
+            # Cache cold — fetch fresh (startup or after cache cleared)
             async with self._session.get(
                 AEMO_P5MIN_ACTUAL_URL,
                 timeout=aiohttp.ClientTimeout(total=30)
@@ -368,17 +419,15 @@ class AEMOClient:
 
             pattern = r'PUBLIC_P5MIN_(\d{12})_\d{14}\.zip'
             all_matches = re.findall(pattern, html)
-            
             if not all_matches:
                 return []
 
             latest_timestamp = sorted(all_matches)[-1]
             latest_pattern = f'PUBLIC_P5MIN_{latest_timestamp}_\\d{{14}}\\.zip'
             latest_files = re.findall(latest_pattern, html)
-            
             if not latest_files:
                 return []
-            
+
             latest_file = latest_files[0]
             file_url = f"{AEMO_P5MIN_ACTUAL_URL}{latest_file}"
 
@@ -390,6 +439,7 @@ class AEMOClient:
                     return []
                 content = await response.read()
 
+            self._p5min_zip_cache = {latest_file: content}
             return self._parse_p5min_forecast(content, region, periods)
 
         except Exception as e:
