@@ -209,8 +209,9 @@ class AEMORealtimePriceSensor(AEMOBaseSensor):
             "price_mwh": realtime_data.get("price_mwh"),
             "price_cents": realtime_data.get("price_cents"),
             "timestamp": self._convert_to_iso_timestamp(timestamp),
+            "price_status": realtime_data.get("price_status", ""),
             "region": self._region,
-            "source": "DISPATCH" if self.coordinator._dispatch_available else "P5MIN",
+            "source": "AEMO Dashboard API",
         }
 
 
@@ -444,6 +445,9 @@ class AEMORealtimeDemandSensor(AEMOBaseSensor):
         return {
             "demand_mw": realtime_data.get("demand_mw"),
             "timestamp": self._convert_to_iso_timestamp(timestamp),
+            "net_interchange_mw": realtime_data.get("net_interchange_mw"),
+            "scheduled_generation_mw": realtime_data.get("scheduled_generation_mw"),
+            "semischeduled_generation_mw": realtime_data.get("semischeduled_generation_mw"),
             "region": self._region,
-            "source": "DISPATCH" if self.coordinator._dispatch_available else "Waiting",
+            "source": "AEMO Dashboard API",
         }

@@ -19,6 +19,8 @@ from .const import (
     AEMO_P5MIN_ACTUAL_URL,
     AEMO_DISPATCH_URL,
     AEMO_PREDISPATCH_BASE_URL,
+    AEMO_DASHBOARD_URL,
+    AEMO_DASHBOARD_API_KEY,
     NEM_REGIONS,
 )
 
@@ -38,6 +40,117 @@ class AEMOClient:
         
         # For spike detection
         self._price_history: list[float] = []  # Last 12 prices (1 hour)
+
+    async def fetch_dashboard_summary(self) -> dict[str, dict[str, Any]]:
+        """Fetch real-time price and demand for all NEM regions from the AEMO
+        public dashboard API.
+
+        This is a single lightweight JSON request (~30 ms, ~4 KB) that returns
+        the latest DISPATCH-period price and demand for every NEM region at
+        once.  It is far cheaper than downloading and parsing a DISPATCH ZIP
+        and is updated at the same 5-minute cadence.
+
+        The API key below is AEMO's own public key embedded in their dispatch
+        overview dashboard — it is not a secret and does not require auth.
+
+        Returns a dict keyed by regionId, e.g.::
+
+            {
+                "NSW1": {
+                    "price_mwh": 58.55,
+                    "price_cents": 5.855,
+                    "price_dollars": 0.05855,
+                    "demand_mw": 7536.82,
+                    "timestamp": "2026/05/24 09:25:00",   # AEST, AEMO style
+                    "settlement_date": "2026-05-24T09:25:00+10:00",
+                    "price_status": "FIRM",
+                    "net_interchange_mw": -459.65,
+                    "scheduled_generation_mw": 4673.06,
+                    "semischeduled_generation_mw": 2349.73,
+                },
+                ...
+            }
+
+        Returns an empty dict on any error so callers can fall back gracefully.
+        """
+        try:
+            async with self._session.get(
+                AEMO_DASHBOARD_URL,
+                headers={
+                    "x-api-key": AEMO_DASHBOARD_API_KEY,
+                    "accept": "application/json",
+                    # Match the caching headers used by AEMO's own dashboard so
+                    # we always receive a fresh response rather than a CDN hit.
+                    "cache-control": "no-cache, no-store, must-revalidate",
+                    "pragma": "no-cache",
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status != 200:
+                    _LOGGER.debug(
+                        "Dashboard API returned HTTP %d", response.status
+                    )
+                    return {}
+                payload = await response.json(content_type=None)
+
+        except Exception as exc:
+            _LOGGER.debug("Dashboard API request failed: %s", exc)
+            return {}
+
+        try:
+            summary_list = payload["data"]["summary"]
+        except (KeyError, TypeError) as exc:
+            _LOGGER.warning("Unexpected dashboard API schema: %s", exc)
+            return {}
+
+        result: dict[str, dict[str, Any]] = {}
+        for entry in summary_list:
+            region_id = entry.get("regionId", "")
+            if region_id not in NEM_REGIONS:
+                continue
+
+            # settlementDate is ISO-8601 with AEST offset, e.g.
+            # "2026-05-24T09:25:00+10:00" — convert to AEMO's canonical
+            # "YYYY/MM/DD HH:MM:SS" string so the rest of the codebase works
+            # unchanged (timestamp parsing, period-clock arithmetic, etc.).
+            settlement_iso = entry.get("settlementDate", "")
+            aemo_ts = ""
+            try:
+                from datetime import timezone, timedelta as _td
+                # Parse the ISO timestamp (handles +10:00 / +11:00 offsets)
+                from datetime import datetime as _dt
+                dt_aware = _dt.fromisoformat(settlement_iso)
+                # Express in AEST (UTC+10) — AEMO always uses AEST internally
+                aest = timezone(_td(hours=10))
+                dt_aest = dt_aware.astimezone(aest)
+                aemo_ts = dt_aest.strftime("%Y/%m/%d %H:%M:%S")
+            except (ValueError, TypeError):
+                aemo_ts = settlement_iso  # fall back to raw ISO string
+
+            price_mwh: float = entry.get("price", 0.0) or 0.0
+            result[region_id] = {
+                "price_mwh": price_mwh,
+                "price_cents": price_mwh / 10,
+                "price_dollars": price_mwh / 1000,
+                "demand_mw": entry.get("totalDemand", 0.0) or 0.0,
+                "timestamp": aemo_ts,
+                "settlement_date": settlement_iso,
+                "price_status": entry.get("priceStatus", ""),
+                "net_interchange_mw": entry.get("netInterchange", 0.0) or 0.0,
+                "scheduled_generation_mw": round(
+                    entry.get("scheduledGeneration", 0.0) or 0.0, 2
+                ),
+                "semischeduled_generation_mw": round(
+                    entry.get("semischeduledGeneration", 0.0) or 0.0, 2
+                ),
+            }
+
+        _LOGGER.debug(
+            "Dashboard API: fetched %d regions, timestamp=%s",
+            len(result),
+            next(iter(result.values()), {}).get("timestamp", "?"),
+        )
+        return result
 
     async def poll_dispatch_directory(self) -> str:
         """Fetch the DISPATCH directory listing and return the latest filename.

@@ -1,42 +1,45 @@
-"""Data update coordinator — PRECISE PERIOD-ANCHORED POLLING.
+"""Data update coordinator — PERIOD-ANCHORED DASHBOARD POLLING.
 
 Polling strategy
 ----------------
-The coordinator runs in one of two modes, anchored to the moment the most
-recent DISPATCH file was successfully received (T=0):
+Realtime price and demand are fetched from AEMO's public dashboard JSON API
+(``/NEM/v1/PWS/NEMDashboard/elecSummary``).  The coordinator runs in two
+modes anchored to the 5-minute DISPATCH period boundaries:
 
-  SLOW mode  (T+0 → next_boundary + HUNT_START_OFFSET)
-    update_interval = 60 s
-    Each tick polls the DISPATCH *directory only* (cheap, ~5 KB).
-    Also polls the P5MIN and Predispatch directory listings.
-    ZIPs are only downloaded when a new filename is detected.
+  WAIT mode  (period confirmed → next boundary)
+    update_interval = WAIT_INTERVAL (60 s)
+    A single dashboard call per tick to keep cached values fresh.
+    No new period is expected yet so fast polling would be wasted.
 
-  HUNT mode  (next_boundary + HUNT_START_OFFSET → file found, or timeout)
-    update_interval = 1 s
-    Each tick calls poll_dispatch_directory() only.
-    On a new filename  → fetch_dispatch_zip() → update sensors → SLOW mode.
-    After HUNT_TIMEOUT → log warning, advance expected boundary by 5 min,
-                         stay in SLOW mode until next boundary.
+  HUNT mode  (next boundary → new period found, or timeout)
+    update_interval = HUNT_INTERVAL (5 s)
+    Polls the dashboard every 5 s waiting for settlementDate to advance.
+    On a new period  → update sensors, fetch forecast ZIPs, → WAIT mode.
+    After HUNT_TIMEOUT with no new period → advance expected boundary by
+    5 minutes, log a warning, return to WAIT mode.
 
 Timing constants
 ----------------
-  HUNT_START_OFFSET =  15 s  (start 1-second polling 15 s into new period)
-  HUNT_TIMEOUT      = 180 s  (give up after 3 minutes of 1-second polling)
-  SLOW_INTERVAL     =  60 s  (poll interval outside the hunt window)
+  HUNT_START_OFFSET =  5 s   HUNT begins exactly on the period boundary
+  HUNT_TIMEOUT      = 90 s   give up after 90 s of fast polling
+  HUNT_INTERVAL     = 5 s   poll interval during HUNT mode
+  WAIT_INTERVAL     = 60 s   poll interval during WAIT mode
 
 Example timeline
 ----------------
-  12:05:03  New DISPATCH file received → T=0, SLOW mode
-  12:05:03 … 12:10:15  SLOW ticks every 60 s (no new DISPATCH file expected)
-  12:10:15  HUNT mode begins (15 s past the 12:10:00 boundary)
-  12:10:15 … 12:10:38  1-second directory polls, no new file yet
-  12:10:38  New filename detected → ZIP downloaded → sensors updated → SLOW
-  12:10:38 … 12:15:15  SLOW mode again
+  12:05:08  Dashboard returns settlementDate 12:05:00 → new period confirmed
+            → forecast ZIPs fetched, mode → WAIT
+  12:05:08 … 12:10:00  WAIT ticks every 60 s (4 cheap dashboard calls)
+  12:10:00  HUNT mode begins exactly on the boundary
+  12:10:00  Dashboard still shows 12:05:00 → waiting…
+  12:10:10  Dashboard still shows 12:05:00 → waiting…
+  12:10:20  Dashboard returns settlementDate 12:10:00 → new period!
+            → forecast ZIPs fetched, mode → WAIT until 12:15:00
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -46,21 +49,23 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .aemo_client import AEMOClient
 from .const import (
     CONF_NEM_REGION,
+    DASHBOARD_POLL_INTERVAL,
     DOMAIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Timing constants — edit here if you need to tune behaviour
+# Timing constants
 # ---------------------------------------------------------------------------
-HUNT_START_OFFSET: int = 15    # seconds past boundary before 1 s polling starts
-HUNT_TIMEOUT: int = 180        # seconds of 1 s polling before giving up
-SLOW_INTERVAL: int = 60        # seconds between ticks in SLOW mode
+HUNT_START_OFFSET: int = 5    # seconds past boundary before HUNT begins
+HUNT_TIMEOUT: int = 90        # seconds of HUNT polling before giving up
+HUNT_INTERVAL: int = DASHBOARD_POLL_INTERVAL   # fast poll interval (5 s)
+WAIT_INTERVAL: int = 60       # slow poll interval between periods
 
 
 class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinator with period-anchored two-mode polling."""
+    """Coordinator with period-anchored two-mode dashboard polling."""
 
     def __init__(
         self,
@@ -72,7 +77,7 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=1),
+            update_interval=timedelta(seconds=HUNT_INTERVAL),
         )
 
         self.config = config
@@ -81,32 +86,35 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self.region: str = config.get(CONF_NEM_REGION, "NSW1")
 
-        # ── Polling state ─────────────────────────────────────────────
-        # 'slow'  — waiting for the next period boundary + offset
-        # 'hunt'  — doing 1-second DISPATCH directory polls
-        self._polling_mode: str = "slow"
-
-        # Wall-clock time of the *start* of the period we currently hold
-        # data for.  None until the first DISPATCH file is received.
-        # Used to derive the next expected boundary.
-        self._period_start: datetime | None = None
-
-        # Wall-clock time when HUNT mode began.  Used for timeout tracking.
-        self._hunt_start: datetime | None = None
-
-        # ── File tracking ─────────────────────────────────────────────
-        self._last_dispatch_file: str | None = None
+        # ── File tracking (ZIPs only fetched when filename changes) ───
         self._last_p5min_file: str | None = None
         self._last_predispatch_file: str | None = None
 
-        # ── Misc state ────────────────────────────────────────────────
+        # ── Period clock ──────────────────────────────────────────────
+        # AEMO SETTLEMENTDATE of the period we currently hold data for.
+        # None until the first successful dashboard fetch.
+        self._last_settlement_date: str | None = None
+
+        # Wall-clock time of the period-start boundary we currently hold
+        # (= settlementDate − 5 min, in local time).  Used to derive the
+        # next HUNT window open time.
+        self._period_start: datetime | None = None
+
+        # ── Mode state ────────────────────────────────────────────────
+        # 'hunt'  — polling every HUNT_INTERVAL seconds for a new period
+        # 'wait'  — polling every WAIT_INTERVAL seconds between periods
+        self._polling_mode: str = "hunt"   # start in HUNT to grab data fast
+        self._hunt_start: datetime | None = None
+
+        # ── Misc ──────────────────────────────────────────────────────
         self._dispatch_available: bool = False
         self._update_count: int = 0
 
         _LOGGER.info(
             "AEMO Coordinator initialised for %s "
-            "(HUNT_START=%ds, HUNT_TIMEOUT=%ds, SLOW_INTERVAL=%ds)",
-            self.region, HUNT_START_OFFSET, HUNT_TIMEOUT, SLOW_INTERVAL,
+            "(HUNT every %ds, WAIT every %ds, HUNT_START+%ds, timeout %ds)",
+            self.region, HUNT_INTERVAL, WAIT_INTERVAL,
+            HUNT_START_OFFSET, HUNT_TIMEOUT,
         )
 
     # ------------------------------------------------------------------
@@ -117,136 +125,124 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Create the HTTP session and AEMO client."""
         self._session = aiohttp.ClientSession()
         self._aemo_client = AEMOClient(self._session)
-        _LOGGER.info("AEMO client ready")
+        _LOGGER.info("AEMO client ready (period-anchored dashboard mode)")
 
     # ------------------------------------------------------------------
-    # Timestamp helpers
+    # Period-clock helpers
     # ------------------------------------------------------------------
 
-    def _parse_aemo_timestamp(self, timestamp_str: str) -> datetime | None:
-        """Parse an AEMO period-ending timestamp to a naive local datetime.
+    def _settlement_to_period_start(self, settlement_ts: str) -> datetime | None:
+        """Convert an AEMO-style timestamp to a naive local period-start datetime.
 
-        AEMO always publishes timestamps in AEST (UTC+10).  We convert to
-        the local system timezone so comparisons with datetime.now() work
-        correctly regardless of whether the host is in AEST or AEDT.
-        """
-        if not timestamp_str or "/" not in timestamp_str:
-            return None
-        try:
-            from datetime import timezone, timedelta as _td
-            dt_naive = datetime.strptime(timestamp_str, "%Y/%m/%d %H:%M:%S")
-            aest = timezone(_td(hours=10))
-            return dt_naive.replace(tzinfo=aest).astimezone().replace(tzinfo=None)
-        except (ValueError, TypeError) as exc:
-            _LOGGER.debug("Cannot parse AEMO timestamp %r: %s", timestamp_str, exc)
-            return None
-
-    def _next_boundary_after(self, t: datetime) -> datetime:
-        """Return the next 5-minute clock boundary strictly after *t*."""
-        # Truncate to the current 5-minute slot, then add 5 minutes
-        slot_start = t.replace(
-            minute=(t.minute // 5) * 5,
-            second=0,
-            microsecond=0,
-        )
-        return slot_start + timedelta(minutes=5)
-
-    def _period_start_from_settlement(self, timestamp_str: str) -> datetime | None:
-        """Derive the period-start boundary from an AEMO SETTLEMENTDATE.
-
-        AEMO SETTLEMENTDATE is a period-END timestamp always on a 5-minute
-        boundary (e.g. "2025/01/15 05:05:00" for the 05:00–05:05 period).
-        Subtracting 5 minutes gives the exact period-start boundary, which
-        is used as the anchor for the next HUNT window calculation.
+        AEMO timestamps are period-END boundaries in AEST (UTC+10), e.g.
+        "2026/05/24 09:25:00" represents the 09:20–09:25 period.
+        Subtracting 5 minutes gives the period-start boundary used for
+        computing when the next HUNT window should open.
 
         Returns a naive local-timezone datetime, or None on parse failure.
         """
-        dt = self._parse_aemo_timestamp(timestamp_str)
-        if dt is None:
+        if not settlement_ts or "/" not in settlement_ts:
             return None
-        return dt - timedelta(minutes=5)
+        try:
+            aest = timezone(timedelta(hours=10))
+            dt_naive = datetime.strptime(settlement_ts, "%Y/%m/%d %H:%M:%S")
+            dt_aest = dt_naive.replace(tzinfo=aest)
+            # Convert to local time, strip tzinfo for comparison with datetime.now()
+            dt_local = dt_aest.astimezone().replace(tzinfo=None)
+            return dt_local - timedelta(minutes=5)
+        except (ValueError, TypeError) as exc:
+            _LOGGER.debug("Cannot parse AEMO timestamp %r: %s", settlement_ts, exc)
+            return None
+
+    def _next_boundary(self, period_start: datetime) -> datetime:
+        """Return the next 5-minute boundary strictly after period_start."""
+        slot = period_start.replace(
+            minute=(period_start.minute // 5) * 5,
+            second=0,
+            microsecond=0,
+        )
+        return slot + timedelta(minutes=5)
 
     # ------------------------------------------------------------------
-    # Mode-transition logic — called once per tick, BEFORE any fetching
+    # Mode-transition logic
     # ------------------------------------------------------------------
 
-    def _update_polling_mode(self) -> None:
-        """Transition between SLOW and HUNT based on wall-clock time.
+    def _update_polling_mode(self, now: datetime) -> None:
+        """Transition between WAIT and HUNT modes and adjust update_interval.
 
-        This method only changes self._polling_mode and self.update_interval;
-        it never fetches anything.
+        Called at the start of every tick, before any network I/O.
 
-        Transition rules
-        ----------------
-        SLOW → HUNT  when  now >= next_boundary + HUNT_START_OFFSET
-        HUNT → SLOW  when  new file found (handled in _async_update_data)
-                     OR    hunt duration >= HUNT_TIMEOUT (handled here)
+        WAIT → HUNT  when  now >= next_boundary + HUNT_START_OFFSET
+        HUNT → WAIT  handled in _async_update_data after new period confirmed
+                     OR here on HUNT_TIMEOUT
         """
-        now = datetime.now()
-
-        if self._polling_mode == "slow":
+        if self._polling_mode == "wait":
             if self._period_start is None:
-                # No data yet — stay in SLOW but keep a short interval so we
-                # pick up the very first file quickly.
-                self.update_interval = timedelta(seconds=SLOW_INTERVAL)
+                # No period clock yet — stay in HUNT until first data arrives
                 return
 
-            next_boundary = self._next_boundary_after(self._period_start)
-            hunt_open = next_boundary + timedelta(seconds=HUNT_START_OFFSET)
-
+            hunt_open = (
+                self._next_boundary(self._period_start)
+                + timedelta(seconds=HUNT_START_OFFSET)
+            )
             if now >= hunt_open:
                 self._polling_mode = "hunt"
                 self._hunt_start = now
-                self.update_interval = timedelta(seconds=1)
+                self.update_interval = timedelta(seconds=HUNT_INTERVAL)
                 _LOGGER.info(
-                    "→ HUNT mode: boundary was %s, started polling at %s",
-                    next_boundary.strftime("%H:%M:%S"),
+                    "→ HUNT mode  (boundary was %s, HUNT opened at %s)",
+                    self._next_boundary(self._period_start).strftime("%H:%M:%S"),
                     now.strftime("%H:%M:%S"),
                 )
-            else:
-                self.update_interval = timedelta(seconds=SLOW_INTERVAL)
 
         elif self._polling_mode == "hunt":
             if self._hunt_start is None:
-                # Shouldn't happen, but be safe
                 self._hunt_start = now
 
-            hunt_elapsed = (now - self._hunt_start).total_seconds()
-
-            if hunt_elapsed >= HUNT_TIMEOUT:
-                # Gave up waiting — advance the period clock by exactly 5
-                # minutes so we open the next HUNT window at the right time.
+            elapsed = (now - self._hunt_start).total_seconds()
+            if elapsed >= HUNT_TIMEOUT:
                 _LOGGER.warning(
-                    "HUNT timed out after %ds with no new DISPATCH file — "
+                    "HUNT timed out after %ds — no new period found; "
                     "advancing period clock by 5 minutes",
-                    int(hunt_elapsed),
+                    int(elapsed),
                 )
                 if self._period_start is not None:
                     self._period_start += timedelta(minutes=5)
-                self._polling_mode = "slow"
-                self._hunt_start = None
-                self.update_interval = timedelta(seconds=SLOW_INTERVAL)
+                self._enter_wait_mode(now)
+
+    def _enter_wait_mode(self, now: datetime) -> None:
+        """Switch to WAIT mode and log the next HUNT window open time."""
+        self._polling_mode = "wait"
+        self._hunt_start = None
+        self.update_interval = timedelta(seconds=WAIT_INTERVAL)
+
+        if self._period_start is not None:
+            hunt_open = (
+                self._next_boundary(self._period_start)
+                + timedelta(seconds=HUNT_START_OFFSET)
+            )
+            _LOGGER.info(
+                "→ WAIT mode  next HUNT opens at %s",
+                hunt_open.strftime("%H:%M:%S"),
+            )
 
     # ------------------------------------------------------------------
     # Main update loop
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data according to the current polling mode.
-
-        Returns a new dict every call so Home Assistant always detects a
-        change and propagates it to sensor entities.
-        """
+        """Fetch data each tick according to the current polling mode."""
         try:
             self._update_count += 1
+            now = datetime.now()
 
             if self._aemo_client is None:
                 await self._async_setup()
 
-            # Decide mode *before* fetching
-            self._update_polling_mode()
+            # Decide mode before fetching
+            self._update_polling_mode(now)
 
-            # Seed the return dict with whatever we already hold
+            # Carry forward whatever we already hold
             data: dict[str, Any] = {
                 "last_update": None,
                 "realtime_price": None,
@@ -257,23 +253,18 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "spike_info": {},
             }
             if self.data:
-                data.update({
-                    k: self.data[k]
-                    for k in data
-                    if k in self.data
-                })
+                data.update({k: self.data[k] for k in data if k in self.data})
 
-            # ----------------------------------------------------------
-            # HUNT mode — cheap 1-second directory poll only
-            # ----------------------------------------------------------
-            if self._polling_mode == "hunt":
-                await self._hunt_tick(data)
-                return data
+            # Always call the dashboard — it's cheap (~30 ms / ~4 KB)
+            new_period = await self._fetch_dashboard(data)
 
-            # ----------------------------------------------------------
-            # SLOW mode — 60-second maintenance poll
-            # ----------------------------------------------------------
-            await self._slow_tick(data)
+            if new_period:
+                # New 5-minute period confirmed — fetch forecast ZIPs then
+                # drop back to WAIT until the next boundary.
+                await self._fetch_p5min(data)
+                await self._fetch_predispatch(data)
+                self._enter_wait_mode(now)
+
             return data
 
         except Exception as err:
@@ -281,223 +272,103 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"Error fetching AEMO data: {err}") from err
 
     # ------------------------------------------------------------------
-    # HUNT tick
+    # Dashboard fetch
     # ------------------------------------------------------------------
 
-    async def _hunt_tick(self, data: dict[str, Any]) -> None:
-        """One 1-second DISPATCH directory poll during HUNT mode.
+    async def _fetch_dashboard(self, data: dict[str, Any]) -> bool:
+        """Call the AEMO dashboard JSON API and update realtime price/demand.
 
-        On a new filename: download ZIP, update data, transition to SLOW.
-        """
-        filename = await self._aemo_client.poll_dispatch_directory()
-
-        if not filename or filename == self._last_dispatch_file:
-            # No new file yet — nothing to do this tick
-            return
-
-        # ── New file detected ──────────────────────────────────────────
-        _LOGGER.info(
-            "✓ New DISPATCH file detected after %ds of HUNT: %s",
-            int((datetime.now() - self._hunt_start).total_seconds())
-            if self._hunt_start else 0,
-            filename,
-        )
-
-        prices, demands = await self._aemo_client.fetch_dispatch_zip(filename)
-        if not prices:
-            _LOGGER.warning("DISPATCH ZIP parsed empty prices for %s", filename)
-            return
-
-        self._last_dispatch_file = filename
-        self._dispatch_available = True
-
-        region_data = prices.get(self.region, {})
-        demand_data = demands.get(self.region, {})
-
-        if region_data:
-            data["realtime_price"] = region_data
-            data["realtime_demand"] = demand_data if demand_data else region_data
-            data["last_update"] = region_data.get("timestamp")
-            data["spike_info"] = self._aemo_client.calculate_spike_info(
-                region_data.get("price_mwh", 0) or 0
-            )
-
-            # Anchor the period clock to the AEMO SETTLEMENTDATE (period-end
-            # boundary) so the next HUNT window opens at exactly
-            # SETTLEMENTDATE + HUNT_START_OFFSET, regardless of how many
-            # seconds after the boundary this file was received.
-            settlement_ts = region_data.get("timestamp", "")
-            period_start = self._period_start_from_settlement(settlement_ts)
-            if period_start is not None:
-                self._period_start = period_start
-            else:
-                # Fallback: wall-clock minus a conservative offset
-                _LOGGER.warning(
-                    "Could not parse SETTLEMENTDATE %r — using wall-clock fallback",
-                    settlement_ts,
-                )
-                self._period_start = datetime.now() - timedelta(seconds=30)
-
-            _LOGGER.info(
-                "DISPATCH price for %s: $%.4f/kWh  ts=%s  "
-                "(spike=%s, ratio=%.2fx)",
-                self.region,
-                region_data.get("price_dollars", 0),
-                region_data.get("timestamp", "?"),
-                "YES" if data["spike_info"].get("is_spike") else "no",
-                data["spike_info"].get("spike_ratio", 1.0),
-            )
-
-        # Transition to SLOW — next HUNT window opens at next boundary+15s
-        self._polling_mode = "slow"
-        self._hunt_start = None
-        self.update_interval = timedelta(seconds=SLOW_INTERVAL)
-        next_boundary = self._next_boundary_after(self._period_start)
-        hunt_open = next_boundary + timedelta(seconds=HUNT_START_OFFSET)
-        _LOGGER.info(
-            "→ SLOW mode  next HUNT opens at %s",
-            hunt_open.strftime("%H:%M:%S"),
-        )
-
-    # ------------------------------------------------------------------
-    # SLOW tick
-    # ------------------------------------------------------------------
-
-    async def _slow_tick(self, data: dict[str, Any]) -> None:
-        """60-second maintenance poll.
-
-        Checks all three directory listings.  Downloads a ZIP only when a
-        new filename appears.  This keeps the SLOW tick cheap in the common
-        case (three tiny HTTP GETs, no ZIP parsing).
-        """
-        # ── 1. DISPATCH directory — for period-boundary initialisation
-        #       and as a safety net in case a HUNT window was missed ───
-        await self._slow_dispatch(data)
-
-        # ── 2. P5MIN actual + short forecast ──────────────────────────
-        await self._slow_p5min(data)
-
-        # ── 3. Predispatch (30-minute forecast) ───────────────────────
-        await self._slow_predispatch(data)
-
-    async def _slow_dispatch(self, data: dict[str, Any]) -> None:
-        """Check DISPATCH directory during SLOW mode.
-
-        Normally the HUNT window handles new DISPATCH files.  This catches:
-          - the very first file on startup (no period_start yet)
-          - any file that appeared while HA was down between periods
+        Returns True when the settlementDate has advanced (new period), so
+        the caller knows to trigger forecast ZIP fetches and enter WAIT mode.
         """
         try:
-            filename = await self._aemo_client.poll_dispatch_directory()
-            if not filename:
-                return
-
-            if filename == self._last_dispatch_file:
-                # Already have this file — use it only to seed period_start
-                # on first run if we have no period clock yet.
-                if self._period_start is None and self.data:
-                    cached = (self.data.get("realtime_price") or {})
-                    ts = cached.get("timestamp", "")
-                    if ts:
-                        period_start = self._period_start_from_settlement(ts)
-                        if period_start is not None:
-                            self._period_start = period_start
-                            _LOGGER.info(
-                                "Period clock seeded from cached DISPATCH ts: %s → "
-                                "next boundary %s",
-                                ts,
-                                self._next_boundary_after(
-                                    self._period_start
-                                ).strftime("%H:%M:%S"),
-                            )
-                return
-
-            # New file — download and parse
-            _LOGGER.info(
-                "SLOW tick: new DISPATCH file %s (missed by HUNT?)", filename
-            )
-            prices, demands = await self._aemo_client.fetch_dispatch_zip(filename)
-            if not prices:
-                return
-
-            self._last_dispatch_file = filename
-            self._dispatch_available = True
-
-            region_data = prices.get(self.region, {})
-            demand_data = demands.get(self.region, {})
-
-            if region_data:
-                data["realtime_price"] = region_data
-                data["realtime_demand"] = demand_data if demand_data else region_data
-                data["last_update"] = region_data.get("timestamp")
-                data["spike_info"] = self._aemo_client.calculate_spike_info(
-                    region_data.get("price_mwh", 0) or 0
-                )
-                settlement_ts = region_data.get("timestamp", "")
-                period_start = self._period_start_from_settlement(settlement_ts)
-                if period_start is not None:
-                    self._period_start = period_start
-                else:
-                    self._period_start = datetime.now() - timedelta(seconds=30)
-
-                _LOGGER.info(
-                    "SLOW-DISPATCH price for %s: $%.4f/kWh  ts=%s",
-                    self.region,
-                    region_data.get("price_dollars", 0),
-                    region_data.get("timestamp", "?"),
-                )
-
+            all_regions = await self._aemo_client.fetch_dashboard_summary()
         except Exception as exc:
-            _LOGGER.debug("SLOW DISPATCH poll failed: %s", exc)
+            _LOGGER.debug("Dashboard fetch error: %s", exc)
+            return False
 
-    async def _slow_p5min(self, data: dict[str, Any]) -> None:
-        """Check P5MIN directory and download ZIP only on new filename."""
+        if not all_regions:
+            _LOGGER.debug("Dashboard returned no data — retaining cached values")
+            return False
+
+        region_data = all_regions.get(self.region)
+        if not region_data:
+            _LOGGER.warning(
+                "Dashboard response did not include region %s (available: %s)",
+                self.region, list(all_regions.keys()),
+            )
+            return False
+
+        self._dispatch_available = True
+
+        data["realtime_price"] = {
+            "price_mwh": region_data["price_mwh"],
+            "price_cents": region_data["price_cents"],
+            "price_dollars": region_data["price_dollars"],
+            "timestamp": region_data["timestamp"],
+            "price_status": region_data["price_status"],
+        }
+        data["realtime_demand"] = {
+            "demand_mw": region_data["demand_mw"],
+            "timestamp": region_data["timestamp"],
+            "net_interchange_mw": region_data["net_interchange_mw"],
+            "scheduled_generation_mw": region_data["scheduled_generation_mw"],
+            "semischeduled_generation_mw": region_data["semischeduled_generation_mw"],
+        }
+        data["last_update"] = region_data["timestamp"]
+        data["spike_info"] = self._aemo_client.calculate_spike_info(
+            region_data["price_mwh"]
+        )
+
+        # Detect period advance
+        current_ts = region_data["timestamp"]
+        if current_ts == self._last_settlement_date:
+            _LOGGER.debug(
+                "Dashboard: %s  $%.4f/kWh  %.1f MW  (same period %s)",
+                self.region,
+                region_data["price_dollars"],
+                region_data["demand_mw"],
+                current_ts,
+            )
+            return False
+
+        # New period!
+        _LOGGER.info(
+            "New DISPATCH period: %s → %s  $%.4f/kWh  %.1f MW  status=%s",
+            self._last_settlement_date or "(startup)",
+            current_ts,
+            region_data["price_dollars"],
+            region_data["demand_mw"],
+            region_data["price_status"],
+        )
+        self._last_settlement_date = current_ts
+        self._period_start = self._settlement_to_period_start(current_ts)
+        if self._period_start is None:
+            # Fallback: anchor to wall-clock
+            self._period_start = datetime.now() - timedelta(seconds=30)
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Forecast ZIP fetches (only on new period)
+    # ------------------------------------------------------------------
+
+    async def _fetch_p5min(self, data: dict[str, Any]) -> None:
+        """Fetch P5MIN ZIP only when a new file appears in the directory."""
         try:
             p5min_prices, p5min_file = (
                 await self._aemo_client.get_current_prices_with_file()
             )
-
-            if not p5min_file:
+            if not p5min_file or p5min_file == self._last_p5min_file:
+                _LOGGER.debug("P5MIN: no new file (%s)", p5min_file or "none")
                 return
 
-            if p5min_file == self._last_p5min_file:
-                # Seed period clock from cached P5MIN if we have nothing else
-                if self._period_start is None:
-                    region_data = p5min_prices.get(self.region, {})
-                    ts = region_data.get("timestamp", "")
-                    if ts:
-                        period_end_dt = self._parse_aemo_timestamp(ts)
-                        if period_end_dt:
-                            # AEMO timestamps are period-END; subtract 5 min
-                            # to get period-start for boundary arithmetic.
-                            self._period_start = period_end_dt - timedelta(minutes=5)
-                            _LOGGER.info(
-                                "Period clock seeded from cached P5MIN ts: %s → "
-                                "next boundary %s",
-                                ts,
-                                self._next_boundary_after(
-                                    self._period_start
-                                ).strftime("%H:%M:%S"),
-                            )
-                return
-
-            # New P5MIN file
             _LOGGER.info("NEW P5MIN file: %s", p5min_file)
             self._last_p5min_file = p5min_file
 
             region_data = p5min_prices.get(self.region, {})
             if region_data:
                 data["spot_price"] = region_data
-                if not data["last_update"]:
-                    data["last_update"] = region_data.get("timestamp")
-
-                if self._period_start is None:
-                    ts = region_data.get("timestamp", "")
-                    if ts:
-                        period_end_dt = self._parse_aemo_timestamp(ts)
-                        if period_end_dt:
-                            self._period_start = period_end_dt - timedelta(minutes=5)
-
                 _LOGGER.info(
                     "P5MIN spot for %s: $%.4f/kWh  ts=%s",
                     self.region,
@@ -505,7 +376,6 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     region_data.get("timestamp", "?"),
                 )
 
-            # Fetch 5-min forecast from same ZIP
             p5min_forecast = await self._aemo_client.get_p5min_forecast(
                 self.region, periods=12
             )
@@ -515,19 +385,20 @@ class AEMOCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as exc:
             _LOGGER.error("P5MIN poll failed: %s", exc, exc_info=True)
 
-    async def _slow_predispatch(self, data: dict[str, Any]) -> None:
-        """Check Predispatch directory and download ZIP only on new filename."""
+    async def _fetch_predispatch(self, data: dict[str, Any]) -> None:
+        """Fetch Predispatch ZIP only when a new file appears."""
         try:
             forecasts, pd_file = (
                 await self._aemo_client.get_predispatch_forecast_with_file(
                     self.region, periods=96
                 )
             )
-
             if not pd_file or pd_file == self._last_predispatch_file:
                 return
 
-            _LOGGER.info("NEW Predispatch file: %s  (%d periods)", pd_file, len(forecasts))
+            _LOGGER.info(
+                "NEW Predispatch file: %s  (%d periods)", pd_file, len(forecasts)
+            )
             self._last_predispatch_file = pd_file
             data["predispatch_forecast"] = forecasts
 
