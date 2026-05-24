@@ -2,7 +2,7 @@
 
 This integration provides basic yet reliable AEMO spot and forecast data values.
 It uses NEMWEB as data source, with a focus being on speed of data fetch.
-It checks for new data each minute while in standby, and upon the commencement of the 5th minute it will speed up to checking for updates every second, until new data is found (at which point it will slow down polling again to each minute).
+It checks for new data each minute while in standby, and upon the commencement of the 5th minute it will speed up to checking for updates more rapidly, until new data is found (at which point it will slow down polling again to each minute).
 
 
 ## Installation
@@ -25,7 +25,7 @@ Select Region: NSW1 / QLD1 / VIC1 / SA1 / TAS1
 
 | Sensor | Updates | Description |
 |--------|---------|-------------|
-| `sensor.aemo_nemweb_{region}_realtime_price` | 1s | Current spot price |
+| `sensor.aemo_nemweb_{region}_realtime_price` | 5s | Current spot price |
 | `sensor.aemo_nemweb_{region}_5min_forecast` | 30s | Next hour forecast |
 | `sensor.aemo_nemweb_{region}_predispatch_forecast` | 5m | 48-hour forecast |
 | `sensor.aemo_nemweb_{region}_realtime_demand` | 5m | Current cleared demand |
